@@ -82,6 +82,7 @@ type BackupOptions struct {
 	Stdin             bool
 	StdinFilename     string
 	StdinCommand      bool
+	Zip               bool
 	Tags              data.TagLists
 	Host              string
 	FilesFrom         []string
@@ -114,6 +115,7 @@ func (opts *BackupOptions) AddFlags(f *pflag.FlagSet) {
 	f.StringVar(&opts.ExcludeLargerThan, "exclude-larger-than", "", "max `size` of the files to be backed up (allowed suffixes: k/K, m/M, g/G, t/T)")
 	f.BoolVar(&opts.Stdin, "stdin", false, "read backup from stdin")
 	f.StringVar(&opts.StdinFilename, "stdin-filename", "stdin", "`filename` to use when reading from stdin")
+	f.BoolVar(&opts.Zip, "zip", false, "interpret arguments as zip files and back up their contents without extracting them (each zip is stored below /<name of zip without extension>)")
 	f.BoolVar(&opts.StdinCommand, "stdin-from-command", false, "interpret arguments as command to execute and store its stdout")
 	f.Var(&opts.Tags, "tag", "add `tags` for the new snapshot in the format `tag[,tag,...]` (can be specified multiple times)")
 	f.UintVar(&opts.ReadConcurrency, "read-concurrency", 0, "read `n` files concurrently (default: $RESTIC_READ_CONCURRENCY or 2)")
@@ -310,6 +312,18 @@ func (opts BackupOptions) Check(gopts global.Options, args []string) error {
 		}
 	}
 
+	if opts.Zip {
+		if opts.Stdin || opts.StdinCommand {
+			return errors.Fatal("--zip cannot be combined with --stdin or --stdin-from-command")
+		}
+		if len(opts.FilesFrom)+len(opts.FilesFromVerbatim)+len(opts.FilesFromRaw) > 0 {
+			return errors.Fatal("--zip cannot be combined with --files-from options")
+		}
+		if len(args) == 0 {
+			return errors.Fatal("--zip requires at least one zip file as argument")
+		}
+	}
+
 	if opts.Stdin || opts.StdinCommand {
 		if len(opts.FilesFrom) > 0 {
 			return errors.Fatal("--stdin and --files-from cannot be used together")
@@ -357,7 +371,7 @@ func collectRejectByNameFuncs(opts BackupOptions, repo *repository.Repository, w
 // from being saved in a snapshot based on path and file info
 func collectRejectFuncs(opts BackupOptions, targets []string, fs fs.FS, warnf func(msg string, args ...any)) (funcs []archiver.RejectFunc, err error) {
 	// allowed devices
-	if opts.ExcludeOtherFS && !opts.Stdin && !opts.StdinCommand {
+	if opts.ExcludeOtherFS && !opts.Zip && !opts.Stdin && !opts.StdinCommand {
 		f, err := archiver.RejectByDevice(targets, fs)
 		if err != nil {
 			return nil, err
@@ -378,7 +392,7 @@ func collectRejectFuncs(opts BackupOptions, targets []string, fs fs.FS, warnf fu
 		funcs = append(funcs, f)
 	}
 
-	if opts.ExcludeCloudFiles && !opts.Stdin && !opts.StdinCommand {
+	if opts.ExcludeCloudFiles && !opts.Zip && !opts.Stdin && !opts.StdinCommand {
 		f, err := archiver.RejectCloudFiles(warnf)
 		if err != nil {
 			return nil, err
@@ -406,6 +420,10 @@ func collectRejectFuncs(opts BackupOptions, targets []string, fs fs.FS, warnf fu
 func collectTargets(opts BackupOptions, args []string, warnf func(msg string, args ...any), stdin io.ReadCloser) (targets []string, err error) {
 	if opts.Stdin || opts.StdinCommand {
 		return nil, nil
+	}
+
+	if opts.Zip {
+		return zipTargets(args), nil
 	}
 
 	for _, file := range opts.FilesFrom {
@@ -597,6 +615,15 @@ func runBackup(ctx context.Context, opts BackupOptions, gopts global.Options, te
 		localVss := fs.NewLocalVss(errorHandler, messageHandler, vsscfg)
 		defer localVss.DeleteSnapshots()
 		targetFS = localVss
+	}
+
+	if opts.Zip {
+		zipFS, closeZips, err := openZipFS(args)
+		if err != nil {
+			return err
+		}
+		defer closeZips()
+		targetFS = zipFS
 	}
 
 	if opts.Stdin || opts.StdinCommand {
