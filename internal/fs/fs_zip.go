@@ -20,11 +20,14 @@ import (
 type ZipMount struct {
 	Name   string
 	Reader *zip.Reader
+	// Password is used to decrypt encrypted entries, see ZipEncryption.
+	Password string
 }
 
 type zipItem struct {
 	fi       *ExtendedFileInfo
 	file     *zip.File // nil for directories
+	password string
 	children []string
 }
 
@@ -70,10 +73,10 @@ func NewZip(mounts []ZipMount) (FS, error) {
 			z.addDir(path.Dir(name), fi.ModTime)
 			if old, ok := z.items[name]; ok && old.file != nil {
 				// duplicate entry, the last one wins like in most unzip tools
-				old.file, old.fi = f, fi
+				old.file, old.fi, old.password = f, fi, m.Password
 				continue
 			}
-			z.items[name] = &zipItem{fi: fi, file: f}
+			z.items[name] = &zipItem{fi: fi, file: f, password: m.Password}
 			z.link(name)
 		}
 	}
@@ -130,6 +133,11 @@ func zipFileInfo(f *zip.File) *ExtendedFileInfo {
 		fi.Size = 0
 	}
 	return fi
+}
+
+// open returns a reader for the (decrypted and decompressed) content.
+func (it *zipItem) open() (io.ReadCloser, error) {
+	return openZipEntry(it.file, it.password)
 }
 
 func (z *zipFS) lookup(name string) (string, *zipItem, bool) {
@@ -202,7 +210,7 @@ func (f *zipFile) MakeReadable() error {
 	if f.rc != nil {
 		return nil
 	}
-	rc, err := f.item.file.Open()
+	rc, err := f.item.open()
 	if err != nil {
 		return pathError("open", f.name, err)
 	}
@@ -233,7 +241,7 @@ func (f *zipFile) ToNode(ignoreXattrListError bool, warnf func(format string, ar
 	}
 	if node.Type == data.NodeTypeSymlink {
 		// the link target is stored as the content of the entry
-		rc, err := f.item.file.Open()
+		rc, err := f.item.open()
 		if err != nil {
 			return node, err
 		}
